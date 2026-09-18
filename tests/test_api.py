@@ -237,5 +237,238 @@ def test_timeline_unknown_contract_404(client):
     assert r.json()["detail"]["code"] == "CONTRACT_NOT_FOUND"
 
 
+# ---------- 覆盖分析 ----------
+
+def get_coverage(client, contract_no, **params):
+    return client.get(f"/contracts/{contract_no}/coverage", params=params)
+
+
+def kinds(segments):
+    return [(s["kind"], s["from"], s["to"]) for s in segments]
+
+
+def test_coverage_from_ge_to_422(client):
+    # from == to
+    r = get_coverage(client, "C-C1",
+                     **{"from": "2026-01-01T00:00:00Z", "to": "2026-01-01T00:00:00Z"})
+    assert r.status_code == 422
+    assert r.json()["detail"]["code"] == "INVALID_INTERVAL"
+    # from > to
+    r = get_coverage(client, "C-C1",
+                     **{"from": "2026-07-01T00:00:00Z", "to": "2026-01-01T00:00:00Z"})
+    assert r.status_code == 422
+    assert r.json()["detail"]["code"] == "INVALID_INTERVAL"
+
+
+def test_coverage_missing_or_malformed_params_422(client):
+    # 缺少 to
+    r = get_coverage(client, "C-C1", **{"from": "2026-01-01T00:00:00Z"})
+    assert r.status_code == 422
+    assert r.json()["code"] == "INVALID_REQUEST"
+    # 非法时间格式
+    r = get_coverage(client, "C-C1",
+                     **{"from": "2026-01-01T00:00:00Z", "to": "not-a-date"})
+    assert r.status_code == 422
+    assert r.json()["code"] == "INVALID_REQUEST"
+
+
+def test_coverage_unknown_contract_is_whole_window_gap(client):
+    r = get_coverage(client, "GHOST",
+                     **{"from": "2026-01-01T00:00:00Z", "to": "2026-07-01T00:00:00Z",
+                        "known_at": "2026-06-01T00:00:00Z"})
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["contract_no"] == "GHOST"
+    assert data["valid_from"] == "2026-01-01T00:00:00.000000+00:00"
+    assert data["valid_to"] == "2026-07-01T00:00:00.000000+00:00"
+    assert data["known_at"] == "2026-06-01T00:00:00.000000+00:00"
+    assert len(data["segments"]) == 1
+    seg = data["segments"][0]
+    assert seg["kind"] == "gap"
+    assert seg["from"] == data["valid_from"]
+    assert seg["to"] == data["valid_to"]
+    assert seg["basis"] is None
+    assert seg["candidates"] == []
+
+
+def test_coverage_not_yet_recorded_is_gap(client):
+    """known_at 早于所有 recorded_at 时无可见版本，整窗为 gap。"""
+    post_rate(client, contract_no="C-C2", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-06-01T00:00:00Z")
+    r = get_coverage(client, "C-C2",
+                     **{"from": "2026-01-01T00:00:00Z", "to": "2027-01-01T00:00:00Z",
+                        "known_at": "2026-01-01T00:00:00Z"})
+    assert r.status_code == 200
+    assert kinds(r.json()["segments"]) == [
+        ("gap", "2026-01-01T00:00:00.000000+00:00", "2027-01-01T00:00:00.000000+00:00"),
+    ]
+
+
+def test_coverage_gap_covered_gap_with_unique_basis(client):
+    post_rate(client, contract_no="C-C3", rate=0.05,
+              valid_from="2026-03-01T00:00:00Z", valid_to="2026-06-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    r = get_coverage(client, "C-C3",
+                     **{"from": "2026-01-01T00:00:00Z", "to": "2026-12-01T00:00:00Z",
+                        "known_at": "2026-02-01T00:00:00Z"})
+    assert r.status_code == 200, r.text
+    segments = r.json()["segments"]
+    assert kinds(segments) == [
+        ("gap", "2026-01-01T00:00:00.000000+00:00", "2026-03-01T00:00:00.000000+00:00"),
+        ("covered", "2026-03-01T00:00:00.000000+00:00", "2026-06-01T00:00:00.000000+00:00"),
+        ("gap", "2026-06-01T00:00:00.000000+00:00", "2026-12-01T00:00:00.000000+00:00"),
+    ]
+    covered = segments[1]
+    assert covered["basis"]["rate"] == 0.05
+    assert covered["basis"]["version"] == 1
+    assert covered["candidates"] == []
+    # 段连续无缝：上一段终点即下一段起点，且首尾正好咬合查询窗口
+    cuts = [segments[0]["from"]] + [s["to"] for s in segments]
+    assert cuts == [
+        "2026-01-01T00:00:00.000000+00:00",
+        "2026-03-01T00:00:00.000000+00:00",
+        "2026-06-01T00:00:00.000000+00:00",
+        "2026-12-01T00:00:00.000000+00:00",
+    ]
+
+
+def test_coverage_open_ended_version_covers_window(client):
+    post_rate(client, contract_no="C-C4", rate=0.07,
+              valid_from="2026-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    r = get_coverage(client, "C-C4",
+                     **{"from": "2026-03-01T00:00:00Z", "to": "2099-01-01T00:00:00Z",
+                        "known_at": "2026-02-01T00:00:00Z"})
+    segments = r.json()["segments"]
+    assert len(segments) == 1
+    assert segments[0]["kind"] == "covered"
+    assert segments[0]["from"] == "2026-03-01T00:00:00.000000+00:00"
+    assert segments[0]["to"] == "2099-01-01T00:00:00.000000+00:00"
+    assert segments[0]["basis"]["rate"] == 0.07
+
+
+def test_coverage_consecutive_versions_not_merged(client):
+    """相邻 covered 段若版本依据不同，不能合并。"""
+    post_rate(client, contract_no="C-C5", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2026-06-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    post_rate(client, contract_no="C-C5", rate=0.06,
+              valid_from="2026-06-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    r = get_coverage(client, "C-C5",
+                     **{"from": "2026-01-01T00:00:00Z", "to": "2027-01-01T00:00:00Z",
+                        "known_at": "2026-02-01T00:00:00Z"})
+    segments = r.json()["segments"]
+    assert [s["kind"] for s in segments] == ["covered", "covered"]
+    assert segments[0]["basis"]["rate"] == 0.05
+    assert segments[1]["basis"]["rate"] == 0.06
+    assert segments[0]["to"] == segments[1]["from"]
+
+
+def test_coverage_known_at_replays_revision(client):
+    """修订前后认知时点看到不同版本；认知窗口外的版本不参与切分。"""
+    post_rate(client, contract_no="C-C6", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z", reason="初始费率")
+    post_rate(client, contract_no="C-C6", rate=0.08,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-06-01T00:00:00Z", reason="费率更正")
+    params = {"from": "2026-01-01T00:00:00Z", "to": "2027-01-01T00:00:00Z"}
+    before = get_coverage(client, "C-C6", known_at="2026-03-01T00:00:00Z", **params).json()
+    after = get_coverage(client, "C-C6", known_at="2026-07-01T00:00:00Z", **params).json()
+
+    assert len(before["segments"]) == 1
+    assert before["segments"][0]["kind"] == "covered"
+    assert before["segments"][0]["basis"]["version"] == 1
+    assert before["segments"][0]["basis"]["rate"] == 0.05
+
+    assert len(after["segments"]) == 1
+    assert after["segments"][0]["kind"] == "covered"
+    assert after["segments"][0]["basis"]["version"] == 2
+    assert after["segments"][0]["basis"]["rate"] == 0.08
+
+
+def test_coverage_superseded_version_not_visible_after_its_end(client):
+    """版本恰好在 known_at 被取代（superseded_at == known_at，右开）即不可见。"""
+    post_rate(client, contract_no="C-C6b", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    post_rate(client, contract_no="C-C6b", rate=0.08,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-06-01T00:00:00Z")
+    r = get_coverage(client, "C-C6b",
+                     **{"from": "2026-01-01T00:00:00Z", "to": "2027-01-01T00:00:00Z",
+                        "known_at": "2026-06-01T00:00:00Z"})
+    segments = r.json()["segments"]
+    assert len(segments) == 1
+    assert segments[0]["basis"]["version"] == 2
+
+
+def test_coverage_conflict_carries_all_candidates(client):
+    """注入互相重叠的脏数据：覆盖段、冲突段、覆盖段依次出现，候选完整。"""
+    post_rate(client, contract_no="C-C7", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    db = os.environ["DATABASE_PATH"]
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT INTO rate_versions "
+            "(contract_no, rate, valid_from, valid_to, recorded_at, version) "
+            "VALUES ('C-C7', 0.99, '2026-03-01T00:00:00.000000+00:00', "
+            "        '2026-06-01T00:00:00.000000+00:00', "
+            "        '2026-01-01T00:00:00.000000+00:00', 2)"
+        )
+    r = get_coverage(client, "C-C7",
+                     **{"from": "2026-01-01T00:00:00Z", "to": "2027-01-01T00:00:00Z",
+                        "known_at": "2026-02-01T00:00:00Z"})
+    assert r.status_code == 200, r.text
+    segments = r.json()["segments"]
+    assert [s["kind"] for s in segments] == ["covered", "conflict", "covered"]
+    conflict = segments[1]
+    assert conflict["from"] == "2026-03-01T00:00:00.000000+00:00"
+    assert conflict["to"] == "2026-06-01T00:00:00.000000+00:00"
+    assert conflict["basis"] is None
+    assert [c["rate"] for c in conflict["candidates"]] == [0.05, 0.99]
+    assert {c["version"] for c in conflict["candidates"]} == {1, 2}
+    # 冲突两侧 covered 依据相同但不相邻，不得跨冲突合并
+    assert segments[0]["basis"]["version"] == 1
+    assert segments[2]["basis"]["version"] == 1
+    assert segments[0]["to"] == conflict["from"]
+    assert conflict["to"] == segments[2]["from"]
+
+
+def test_coverage_clips_intervals_to_window_and_merges_same_key(client):
+    """版本区间伸出查询窗口时按窗口裁剪；可见版本之外的边界不产生切分点。"""
+    # v1: 2025 全年（窗口左侧伸出），v2: 2027-01 起开放（窗口右侧伸出）
+    post_rate(client, contract_no="C-C8", rate=0.1,
+              valid_from="2025-01-01T00:00:00Z", valid_to="2026-01-01T00:00:00Z",
+              recorded_at="2025-01-01T00:00:00Z")
+    post_rate(client, contract_no="C-C8", rate=0.2,
+              valid_from="2026-06-01T00:00:00Z",
+              recorded_at="2025-01-01T00:00:00Z")
+    r = get_coverage(client, "C-C8",
+                     **{"from": "2026-01-01T00:00:00Z", "to": "2027-01-01T00:00:00Z",
+                        "known_at": "2026-01-01T00:00:00Z"})
+    segments = r.json()["segments"]
+    assert kinds(segments) == [
+        ("gap", "2026-01-01T00:00:00.000000+00:00", "2026-06-01T00:00:00.000000+00:00"),
+        ("covered", "2026-06-01T00:00:00.000000+00:00", "2027-01-01T00:00:00.000000+00:00"),
+    ]
+    assert segments[1]["basis"]["rate"] == 0.2
+
+
+def test_coverage_default_known_at_is_now(client):
+    post_rate(client, contract_no="C-C9", rate=0.03,
+              valid_from="2020-01-01T00:00:00Z")
+    r = get_coverage(client, "C-C9",
+                     **{"from": "2026-01-01T00:00:00Z", "to": "2027-01-01T00:00:00Z"})
+    assert r.status_code == 200
+    segments = r.json()["segments"]
+    assert len(segments) == 1
+    assert segments[0]["kind"] == "covered"
+    assert segments[0]["basis"]["rate"] == 0.03
+
+
 def test_health(client):
     assert client.get("/health").json() == {"status": "ok"}

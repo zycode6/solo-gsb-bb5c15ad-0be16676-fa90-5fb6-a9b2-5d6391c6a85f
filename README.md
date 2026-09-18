@@ -83,6 +83,54 @@ curl http://localhost:8000/contracts/HT-2026-001/timeline
 按版本号列出全部版本及其业务/系统时间区间与状态（`current` / `superseded`）；
 合同不存在返回 `404 CONTRACT_NOT_FOUND`。
 
+### 4. 覆盖分析 — `GET /contracts/{contract_no}/coverage`
+
+给定业务窗口 `[from, to)` 与认知时点 `known_at`，先按
+`recorded_at`/`superseded_at` 筛出该认知时点可见的版本，再以所有有效区间
+边界切分窗口，返回首尾相接、覆盖整个窗口的连续 `segments`：
+
+```bash
+curl "http://localhost:8000/contracts/HT-2026-001/coverage?from=2026-01-01T00:00:00Z&to=2027-01-01T00:00:00Z&known_at=2026-06-01T00:00:00Z"
+```
+
+```json
+{
+  "contract_no": "HT-2026-001",
+  "valid_from": "2026-01-01T00:00:00.000000+00:00",
+  "valid_to":   "2027-01-01T00:00:00.000000+00:00",
+  "known_at":   "2026-06-01T00:00:00.000000+00:00",
+  "segments": [
+    {
+      "from": "2026-01-01T00:00:00.000000+00:00",
+      "to":   "2026-04-01T00:00:00.000000+00:00",
+      "kind": "gap",
+      "basis": null,
+      "candidates": []
+    },
+    {
+      "from": "2026-04-01T00:00:00.000000+00:00",
+      "to":   "2027-01-01T00:00:00.000000+00:00",
+      "kind": "covered",
+      "basis": { "rate_id": 1, "version": 1, "rate": 0.052, "...": "唯一版本依据" },
+      "candidates": []
+    }
+  ]
+}
+```
+
+- `kind` 取值：
+  - `covered` — 窗口该位置恰有一个可见有效版本，`basis` 附该唯一版本依据；
+  - `gap` — 无任何可见版本（`basis` 为 `null`）；即使整窗无可见版本，也返回
+    覆盖整个 `[from, to)` 的单个 `gap` 段，而不是 404；
+  - `conflict` — 多个版本业务区间重叠（脏数据），`candidates` 附全部候选版本。
+- 相邻段若**分类与候选集合完全相同**会自动合并为一段；依据不同的两个
+  `covered` 段不会合并。
+- 所有段左闭右开、首尾相接，恰覆盖 `[from, to)`。
+- `known_at` 缺省为当前时间；回放历史认知时点即可看到当时可见的版本
+  （修订后版本不再参与切分）。
+- `from >= to` 返回 `422 INVALID_INTERVAL`；缺参或时间格式非法返回
+  `422 INVALID_REQUEST`。
+
 ## 本地开发（不用 Docker）
 
 ```bash
@@ -97,7 +145,7 @@ pytest                 # 运行测试
 ```
 app/
   main.py      FastAPI 路由与请求/响应模型
-  logic.py     双时态核心逻辑（追加式录入、时点查询、时间线）
+  logic.py     双时态核心逻辑（追加式录入、时点查询、覆盖分段、时间线）
   db.py        SQLite 连接与自动建表
   timeutil.py  UTC 时间规范化（等宽 ISO 字符串，可字典序比较）
 tests/test_api.py

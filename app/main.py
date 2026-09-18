@@ -3,13 +3,13 @@
 import sqlite3
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from . import logic
 from .db import init_db
@@ -70,6 +70,26 @@ class QuoteResponse(BaseModel):
 class TimelineResponse(BaseModel):
     contract_no: str
     versions: list[VersionView]
+
+
+class CoverageSegment(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    start: str = Field(alias="from", description="段起点（含），ISO-8601")
+    end: str = Field(alias="to", description="段终点（不含），ISO-8601")
+    kind: Literal["covered", "gap", "conflict"] = Field(description="覆盖分类")
+    basis: Optional[VersionView] = Field(default=None, description="covered 段唯一版本依据")
+    candidates: list[VersionView] = Field(
+        default_factory=list, description="conflict 段的全部候选版本"
+    )
+
+
+class CoverageResponse(BaseModel):
+    contract_no: str
+    valid_from: str
+    valid_to: str
+    known_at: str
+    segments: list[CoverageSegment]
 
 
 def to_view(row: sqlite3.Row) -> VersionView:
@@ -174,3 +194,48 @@ def timeline(contract_no: str):
             detail={"code": "CONTRACT_NOT_FOUND", "message": f"合同 '{contract_no}' 无任何费率版本"},
         )
     return TimelineResponse(contract_no=contract_no, versions=[to_view(r) for r in rows])
+
+
+@app.get("/contracts/{contract_no}/coverage", response_model=CoverageResponse)
+def coverage(
+    contract_no: str,
+    from_at: datetime = Query(alias="from", description="业务窗口起点（含），ISO-8601"),
+    to: datetime = Query(description="业务窗口终点（不含），ISO-8601"),
+    known_at: Optional[datetime] = Query(default=None, description="认知时点，缺省为当前时间"),
+):
+    """覆盖分析：以 known_at 时点可见版本切分业务窗口 [from, to) 为连续段。
+
+    每段标记 covered（唯一版本依据 basis）、gap（无版本）或 conflict
+    （附全部 candidates）；相邻且分类与候选完全相同的段自动合并。
+    无可见版本时仍返回覆盖整个查询窗口的单个 gap 段。
+    """
+    if from_at >= to:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "code": "INVALID_INTERVAL",
+                "message": "from 必须早于 to（查询区间左闭右开 [from, to)）",
+            },
+        )
+
+    segments, ka = logic.coverage_segments(contract_no, from_at, to, known_at)
+    return CoverageResponse(
+        contract_no=contract_no,
+        valid_from=iso(from_at),
+        valid_to=iso(to),
+        known_at=ka,
+        segments=[
+            CoverageSegment(
+                **{
+                    "from": seg["start"],
+                    "to": seg["end"],
+                    "kind": seg["kind"],
+                    "basis": to_view(seg["rows"][0]) if seg["kind"] == "covered" else None,
+                    "candidates": [to_view(r) for r in seg["rows"]]
+                    if seg["kind"] == "conflict"
+                    else [],
+                }
+            )
+            for seg in segments
+        ],
+    )

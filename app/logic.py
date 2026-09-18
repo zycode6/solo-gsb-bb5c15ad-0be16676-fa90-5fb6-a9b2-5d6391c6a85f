@@ -120,6 +120,98 @@ def find_visible_rates(
     return list(rows), ka
 
 
+def find_visible_versions(
+    contract_no: str, known_at: Optional[datetime]
+) -> tuple[list[sqlite3.Row], str]:
+    """查询在 known_at 认知时点可见的全部版本（不限业务时间）。
+
+    可见条件（系统时间左闭右开）：
+    recorded_at <= known_at，且 superseded_at 为空或晚于 known_at。
+    返回 (版本行列表（按业务起点、id 升序）, 实际使用的 known_at)。
+    """
+    ka = iso(known_at) if known_at is not None else now_iso()
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM rate_versions "
+            "WHERE contract_no = ? "
+            "  AND recorded_at <= ? "
+            "  AND (superseded_at IS NULL OR superseded_at > ?) "
+            "ORDER BY valid_from ASC, id ASC",
+            (contract_no, ka, ka),
+        ).fetchall()
+    return list(rows), ka
+
+
+def coverage_segments(
+    contract_no: str,
+    frm: datetime,
+    to: datetime,
+    known_at: Optional[datetime],
+) -> tuple[list[dict], str]:
+    """计算业务窗口 [frm, to) 在 known_at 认知时点下的连续覆盖分段。
+
+    步骤：
+    1. 按 recorded_at/superseded_at 筛出该认知时点可见的全部版本；
+    2. 将各版本业务区间与查询窗口求交，以所有相交边界切分 [frm, to)
+       （左闭右开），段内候选集合恒定；
+    3. 按候选数分类：0 -> gap，1 -> covered，>1 -> conflict；
+    4. 合并相邻且分类与候选（版本 id 集合）完全相同的段。
+
+    无可见版本时，返回覆盖整个查询窗口的单个 gap 段。
+
+    返回 (分段列表, 实际使用的 known_at)。每个分段为
+    {"start", "end", "kind", "rows"}；rows 按 id 升序，
+    covered 恰一条，conflict 为全部候选，gap 为空。
+    """
+    start = iso(frm)
+    end = iso(to)
+    rows, ka = find_visible_versions(contract_no, known_at)
+
+    # 各可见版本业务区间与 [start, end) 求交，并收集全部切分边界
+    boundaries = {start, end}
+    clipped: list[tuple[str, str, sqlite3.Row]] = []
+    for row in rows:
+        vf = row["valid_from"]
+        vt = row["valid_to"] if row["valid_to"] is not None else INF
+        lo = max(start, vf)
+        hi = min(end, vt)
+        if lo < hi:
+            clipped.append((lo, hi, row))
+            boundaries.add(lo)
+            boundaries.add(hi)
+
+    cuts = [start] + sorted(b for b in boundaries if start < b < end) + [end]
+
+    segments: list[dict] = []
+    for lo, hi in zip(cuts, cuts[1:]):
+        # 切分点包含所有相交区间端点，段内候选恒定，用左端点判定即可
+        hits = sorted(
+            (row for vf, vt, row in clipped if vf <= lo < vt),
+            key=lambda r: r["id"],
+        )
+        kind = ("gap", "covered", "conflict")[min(len(hits), 2)]
+        segments.append(
+            {
+                "start": lo,
+                "end": hi,
+                "kind": kind,
+                "rows": hits,
+                "key": (kind, tuple(r["id"] for r in hits)),
+            }
+        )
+
+    # 合并相邻且分类与候选完全相同的段
+    merged: list[dict] = []
+    for seg in segments:
+        if merged and merged[-1]["key"] == seg["key"]:
+            merged[-1]["end"] = seg["end"]
+        else:
+            merged.append(dict(seg))
+    for seg in merged:
+        seg.pop("key")
+    return merged, ka
+
+
 def get_timeline(contract_no: str) -> list[sqlite3.Row]:
     """合同的全部版本，按版本号升序（即录入顺序）。"""
     with connect() as conn:
