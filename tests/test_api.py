@@ -237,5 +237,157 @@ def test_timeline_unknown_contract_404(client):
     assert r.json()["detail"]["code"] == "CONTRACT_NOT_FOUND"
 
 
+# ---------- 覆盖率 ----------
+
+def test_coverage_covered_and_gap(client):
+    post_rate(client, contract_no="CV-1", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2026-07-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    r = client.get("/contracts/CV-1/coverage", params={
+        "from": "2026-03-01T00:00:00Z", "to": "2026-09-01T00:00:00Z",
+        "known_at": "2026-02-01T00:00:00Z"})
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["contract_no"] == "CV-1"
+    assert data["from"] == "2026-03-01T00:00:00.000000+00:00"
+    assert data["to"] == "2026-09-01T00:00:00.000000+00:00"
+    assert data["known_at"] == "2026-02-01T00:00:00.000000+00:00"
+    segs = data["segments"]
+    assert [(s["from"], s["to"], s["status"]) for s in segs] == [
+        ("2026-03-01T00:00:00.000000+00:00", "2026-07-01T00:00:00.000000+00:00", "covered"),
+        ("2026-07-01T00:00:00.000000+00:00", "2026-09-01T00:00:00.000000+00:00", "gap"),
+    ]
+    # covered 段附唯一版本依据；gap 段无依据、无候选
+    assert segs[0]["basis"]["version"] == 1
+    assert segs[0]["basis"]["rate"] == 0.05
+    assert segs[0]["candidates"] == []
+    assert segs[1]["basis"] is None
+    assert segs[1]["candidates"] == []
+
+
+def test_coverage_from_must_precede_to(client):
+    for frm, to in [("2026-09-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+                    ("2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z")]:
+        r = client.get("/contracts/CV-X/coverage", params={"from": frm, "to": to})
+        assert r.status_code == 422
+        assert r.json()["detail"]["code"] == "INVALID_INTERVAL"
+
+
+def test_coverage_missing_params_422(client):
+    r = client.get("/contracts/CV-X/coverage")
+    assert r.status_code == 422
+    assert r.json()["code"] == "INVALID_REQUEST"
+
+
+def test_coverage_no_visible_versions_is_single_gap(client):
+    # 合同不存在 → 覆盖整个查询窗口的 gap
+    r = client.get("/contracts/GHOST/coverage", params={
+        "from": "2026-01-01T00:00:00Z", "to": "2027-01-01T00:00:00Z",
+        "known_at": "2026-06-01T00:00:00Z"})
+    assert r.status_code == 200
+    segs = r.json()["segments"]
+    assert [(s["from"], s["to"], s["status"]) for s in segs] == [
+        ("2026-01-01T00:00:00.000000+00:00", "2027-01-01T00:00:00.000000+00:00", "gap"),
+    ]
+
+    # 合同存在但 known_at 早于 recorded_at → 版本尚不可见，仍整窗 gap
+    post_rate(client, contract_no="CV-2", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z",
+              recorded_at="2026-06-01T00:00:00Z")
+    r = client.get("/contracts/CV-2/coverage", params={
+        "from": "2026-01-01T00:00:00Z", "to": "2027-01-01T00:00:00Z",
+        "known_at": "2026-01-15T00:00:00Z"})
+    assert [s["status"] for s in r.json()["segments"]] == ["gap"]
+
+
+def test_coverage_reflects_known_at(client):
+    """同一业务窗口，修订前后的认知时点看到不同的覆盖结果。"""
+    post_rate(client, contract_no="CV-3", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    post_rate(client, contract_no="CV-3", rate=0.08,
+              valid_from="2026-06-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-03-01T00:00:00Z")
+
+    # 修订前的认知时点：旧版本覆盖整个窗口
+    old = client.get("/contracts/CV-3/coverage", params={
+        "from": "2026-01-01T00:00:00Z", "to": "2027-01-01T00:00:00Z",
+        "known_at": "2026-02-01T00:00:00Z"}).json()
+    assert [(s["status"], s["basis"]["version"] if s["basis"] else None)
+            for s in old["segments"]] == [("covered", 1)]
+
+    # 修订后的认知时点：旧版本已被取代，上半年变为 gap，下半年为新版本
+    new = client.get("/contracts/CV-3/coverage", params={
+        "from": "2026-01-01T00:00:00Z", "to": "2027-01-01T00:00:00Z",
+        "known_at": "2026-03-02T00:00:00Z"}).json()
+    assert [(s["from"], s["status"]) for s in new["segments"]] == [
+        ("2026-01-01T00:00:00.000000+00:00", "gap"),
+        ("2026-06-01T00:00:00.000000+00:00", "covered"),
+    ]
+    assert new["segments"][1]["basis"]["version"] == 2
+    assert new["segments"][1]["basis"]["rate"] == 0.08
+
+
+def test_coverage_multiple_versions_segmentation(client):
+    """相接的两个当前版本在边界处切分；相邻 covered 段候选不同，不合并。"""
+    post_rate(client, contract_no="CV-4", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2026-06-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    post_rate(client, contract_no="CV-4", rate=0.06,
+              valid_from="2026-06-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    data = client.get("/contracts/CV-4/coverage", params={
+        "from": "2025-06-01T00:00:00Z", "to": "2027-06-01T00:00:00Z",
+        "known_at": "2026-02-01T00:00:00Z"}).json()
+    segs = data["segments"]
+    assert [(s["status"], s["basis"]["rate"] if s["basis"] else None) for s in segs] == [
+        ("gap", None), ("covered", 0.05), ("covered", 0.06), ("gap", None),
+    ]
+    # 片段连续铺满整个窗口
+    assert segs[0]["from"] == "2025-06-01T00:00:00.000000+00:00"
+    assert segs[-1]["to"] == "2027-06-01T00:00:00.000000+00:00"
+    for prev, nxt in zip(segs, segs[1:]):
+        assert prev["to"] == nxt["from"]
+    assert segs[1]["to"] == "2026-06-01T00:00:00.000000+00:00"
+
+
+def test_coverage_conflict(client):
+    """直接注入互相重叠的脏数据 → 重叠区段标记 conflict 并附全部候选。"""
+    post_rate(client, contract_no="CV-5", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    db = os.environ["DATABASE_PATH"]
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT INTO rate_versions "
+            "(contract_no, rate, valid_from, valid_to, recorded_at, version) "
+            "VALUES ('CV-5', 0.99, '2026-06-01T00:00:00.000000+00:00', "
+            "        '2026-09-01T00:00:00.000000+00:00', "
+            "        '2026-01-01T00:00:00.000000+00:00', 2)"
+        )
+    data = client.get("/contracts/CV-5/coverage", params={
+        "from": "2026-01-01T00:00:00Z", "to": "2027-01-01T00:00:00Z",
+        "known_at": "2026-02-01T00:00:00Z"}).json()
+    segs = data["segments"]
+    assert [s["status"] for s in segs] == ["covered", "conflict", "covered"]
+    conflict = segs[1]
+    assert conflict["from"] == "2026-06-01T00:00:00.000000+00:00"
+    assert conflict["to"] == "2026-09-01T00:00:00.000000+00:00"
+    assert conflict["basis"] is None
+    assert [c["version"] for c in conflict["candidates"]] == [1, 2]
+
+
+def test_coverage_open_ended_and_default_known_at(client):
+    """无限期区间裁剪到窗口终点；known_at 缺省为当前时间即可见。"""
+    post_rate(client, contract_no="CV-6", rate=0.07,
+              valid_from="2026-01-01T00:00:00Z")
+    data = client.get("/contracts/CV-6/coverage", params={
+        "from": "2026-01-01T00:00:00Z", "to": "2099-01-01T00:00:00Z"}).json()
+    segs = data["segments"]
+    assert [(s["from"], s["to"], s["status"]) for s in segs] == [
+        ("2026-01-01T00:00:00.000000+00:00", "2099-01-01T00:00:00.000000+00:00", "covered"),
+    ]
+
+
 def test_health(client):
     assert client.get("/health").json() == {"status": "ok"}

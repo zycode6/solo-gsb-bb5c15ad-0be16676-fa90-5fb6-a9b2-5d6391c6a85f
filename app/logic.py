@@ -19,7 +19,7 @@ INF = "9999-12-31T23:59:59.999999+00:00"
 
 
 class InvalidIntervalError(ValueError):
-    """valid_to 不晚于 valid_from。"""
+    """区间终点不晚于起点（valid_to <= valid_from，或查询窗口 from >= to）。"""
 
 
 class NonMonotonicRecordTimeError(ValueError):
@@ -128,3 +128,69 @@ def get_timeline(contract_no: str) -> list[sqlite3.Row]:
             (contract_no,),
         ).fetchall()
     return list(rows)
+
+
+def compute_coverage(
+    contract_no: str,
+    from_dt: datetime,
+    to_dt: datetime,
+    known_at: Optional[datetime],
+) -> tuple[list[dict], str]:
+    """计算查询窗口 [from, to) 在 known_at 认知时点下的覆盖率分段。
+
+    先筛出 known_at 可见的版本（recorded_at <= known_at 且未被取代），
+    将其业务区间裁剪到窗口后，以所有区间边界把窗口切成连续片段；
+    每段按命中的候选版本数分类：0 → gap，1 → covered，>1 → conflict；
+    分类与候选完全相同的相邻段合并为一段。
+
+    返回 (segments, 实际使用的 known_at)。segment 为
+    {"from", "to", "status", "candidates": [Row]} 字典，连续铺满整个窗口；
+    无可见版本时自然得到覆盖整窗的单个 gap 段。
+    """
+    f = iso(from_dt)
+    t = iso(to_dt)
+    if f >= t:
+        raise InvalidIntervalError("from 必须早于 to")
+    ka = iso(known_at) if known_at is not None else now_iso()
+
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM rate_versions "
+            "WHERE contract_no = ? "
+            "  AND recorded_at <= ? "
+            "  AND (superseded_at IS NULL OR superseded_at > ?) "
+            "  AND valid_from < ? "
+            "  AND (valid_to IS NULL OR valid_to > ?) "
+            "ORDER BY version ASC, id ASC",
+            (contract_no, ka, ka, t, f),
+        ).fetchall()
+
+    # 可见版本的业务区间裁剪到查询窗口（NULL valid_to 用 INF 占位参与比较）
+    clipped = [
+        (max(row["valid_from"], f), min(row["valid_to"] or INF, t), row)
+        for row in rows
+    ]
+
+    # 以所有区间边界（含窗口端点）切分 [f, t)
+    bounds = sorted({f, t, *(p for s, e, _ in clipped for p in (s, e))})
+
+    segments = []
+    last_key = None  # 上一段的 (分类, 候选 id 元组)，用于相邻段合并
+    for seg_from, seg_to in zip(bounds, bounds[1:]):
+        # 区间边界全部参与切分，故与片段相交的裁剪区间必完整覆盖该片段
+        candidates = [row for s, e, row in clipped if s <= seg_from and e >= seg_to]
+        if not candidates:
+            seg_status = "gap"
+        elif len(candidates) == 1:
+            seg_status = "covered"
+        else:
+            seg_status = "conflict"
+        key = (seg_status, tuple(row["id"] for row in candidates))
+        if key == last_key:
+            segments[-1]["to"] = seg_to
+        else:
+            segments.append(
+                {"from": seg_from, "to": seg_to, "status": seg_status, "candidates": candidates}
+            )
+            last_key = key
+    return segments, ka

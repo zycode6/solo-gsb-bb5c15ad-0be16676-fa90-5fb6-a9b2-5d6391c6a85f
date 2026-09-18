@@ -83,6 +83,44 @@ curl http://localhost:8000/contracts/HT-2026-001/timeline
 按版本号列出全部版本及其业务/系统时间区间与状态（`current` / `superseded`）；
 合同不存在返回 `404 CONTRACT_NOT_FOUND`。
 
+### 4. 覆盖率分析 — `GET /contracts/{contract_no}/coverage`
+
+```bash
+curl "http://localhost:8000/contracts/HT-2026-001/coverage?from=2026-01-01T00:00:00Z&to=2027-01-01T00:00:00Z&known_at=2026-06-01T00:00:00Z"
+```
+
+先按 `recorded_at` / `superseded_at` 筛出 `known_at` 时点可见的版本，
+再以这些版本业务区间的全部边界把查询窗口 `[from, to)` 切分为**连续**片段，
+逐段标记：
+
+| `status` | 含义 | 附带字段 |
+|---|---|---|
+| `covered` | 恰好一个可见版本覆盖该段 | `basis`：唯一版本依据 |
+| `gap` | 无任何可见版本覆盖 | — |
+| `conflict` | 多个可见版本重叠覆盖（脏数据） | `candidates`：全部候选版本 |
+
+分类与候选完全相同的相邻片段会合并为一段。`known_at` 缺省为当前时间；
+`from >= to` 返回 `422 INVALID_INTERVAL`；该认知时点下无任何可见版本时，
+返回一个覆盖整个查询窗口的 `gap` 片段（合同不存在亦然，不报 404）。
+
+响应示例（上半年已被修订取代、下半年被新版本覆盖）：
+
+```json
+{
+  "contract_no": "HT-2026-001",
+  "from": "2026-01-01T00:00:00.000000+00:00",
+  "to": "2027-01-01T00:00:00.000000+00:00",
+  "known_at": "2026-06-01T00:00:00.000000+00:00",
+  "segments": [
+    {"from": "2026-01-01T00:00:00.000000+00:00", "to": "2026-06-01T00:00:00.000000+00:00",
+     "status": "gap", "basis": null, "candidates": []},
+    {"from": "2026-06-01T00:00:00.000000+00:00", "to": "2027-01-01T00:00:00.000000+00:00",
+     "status": "covered", "basis": {"rate_id": 2, "rate": 0.058, "version": 2, "...": "..."},
+     "candidates": []}
+  ]
+}
+```
+
 ## 本地开发（不用 Docker）
 
 ```bash
@@ -97,7 +135,7 @@ pytest                 # 运行测试
 ```
 app/
   main.py      FastAPI 路由与请求/响应模型
-  logic.py     双时态核心逻辑（追加式录入、时点查询、时间线）
+  logic.py     双时态核心逻辑（追加式录入、时点查询、时间线、覆盖率分段）
   db.py        SQLite 连接与自动建表
   timeutil.py  UTC 时间规范化（等宽 ISO 字符串，可字典序比较）
 tests/test_api.py

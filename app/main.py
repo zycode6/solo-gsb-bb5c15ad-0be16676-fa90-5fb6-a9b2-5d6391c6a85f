@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, Query, Request, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from . import logic
 from .db import init_db
@@ -70,6 +70,26 @@ class QuoteResponse(BaseModel):
 class TimelineResponse(BaseModel):
     contract_no: str
     versions: list[VersionView]
+
+
+class CoverageSegment(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    from_: str = Field(alias="from", description="片段起点（含）")
+    to: str = Field(description="片段终点（不含）")
+    status: str = Field(description="covered / gap / conflict")
+    basis: Optional[VersionView] = Field(default=None, description="covered 时命中版本的唯一依据")
+    candidates: list[VersionView] = Field(default_factory=list, description="conflict 时的全部候选版本")
+
+
+class CoverageResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    contract_no: str
+    from_: str = Field(alias="from", description="查询窗口起点（含）")
+    to: str = Field(description="查询窗口终点（不含）")
+    known_at: str = Field(description="实际使用的认知时点")
+    segments: list[CoverageSegment]
 
 
 def to_view(row: sqlite3.Row) -> VersionView:
@@ -174,3 +194,38 @@ def timeline(contract_no: str):
             detail={"code": "CONTRACT_NOT_FOUND", "message": f"合同 '{contract_no}' 无任何费率版本"},
         )
     return TimelineResponse(contract_no=contract_no, versions=[to_view(r) for r in rows])
+
+
+@app.get("/contracts/{contract_no}/coverage", response_model=CoverageResponse)
+def coverage(
+    contract_no: str,
+    from_: datetime = Query(alias="from", description="查询窗口起点（含），ISO-8601"),
+    to: datetime = Query(description="查询窗口终点（不含），ISO-8601"),
+    known_at: Optional[datetime] = Query(default=None, description="认知时点，缺省为当前时间"),
+):
+    """覆盖率分析：以 known_at 可见版本的业务区间边界把 [from, to) 切为连续片段，
+    逐段标记 covered（附唯一版本依据）/ gap / conflict（附全部候选），
+    分类与候选完全相同的相邻段合并。"""
+    try:
+        segments, ka = logic.compute_coverage(contract_no, from_, to, known_at)
+    except logic.InvalidIntervalError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "INVALID_INTERVAL", "message": str(exc)},
+        )
+    return CoverageResponse(
+        contract_no=contract_no,
+        from_=iso(from_),
+        to=iso(to),
+        known_at=ka,
+        segments=[
+            CoverageSegment(
+                from_=seg["from"],
+                to=seg["to"],
+                status=seg["status"],
+                basis=to_view(seg["candidates"][0]) if seg["status"] == "covered" else None,
+                candidates=[to_view(r) for r in seg["candidates"]] if seg["status"] == "conflict" else [],
+            )
+            for seg in segments
+        ],
+    )
